@@ -9,10 +9,11 @@ import (
 )
 
 var (
-	ErrVersionNotSupported     = errors.New("protocol version not supported")
-	ErrCommandNotSupported     = errors.New("request command not supported")
-	ErrInvalidReservedField    = errors.New("invalid reverse field")
-	ErrAddressTypeNotSupported = errors.New("address type not supported")
+	ErrVersionNotSupported       = errors.New("protocol version not supported")
+	ErrMethodVersionNotSupported = errors.New("sub-negotiation method version not supported")
+	ErrCommandNotSupported       = errors.New("request command not supported")
+	ErrInvalidReservedField      = errors.New("invalid reverse field")
+	ErrAddressTypeNotSupported   = errors.New("address type not supported")
 )
 
 const (
@@ -25,11 +26,29 @@ type Server interface {
 }
 
 type SOCKS5Server struct {
-	IP   string
-	Port int
+	IP     string
+	Port   int
+	Config *Config
+}
+
+type Config struct {
+	AuthMethod      Method
+	PasswordChecker func(username, password string) bool
+}
+
+func initConfig(config *Config) error {
+	if config.AuthMethod == MethodPassword && config.PasswordChecker == nil {
+		return ErrPasswordCheckerNotSet
+	}
+	return nil
 }
 
 func (s *SOCKS5Server) Run() error {
+	// Initialize server configuration
+	if err := initConfig(s.Config); err != nil {
+		return err
+	}
+
 	address := fmt.Sprintf("%s:%d", s.IP, s.Port)
 	listener, err := net.Listen("tcp", address)
 	if err != nil {
@@ -43,7 +62,7 @@ func (s *SOCKS5Server) Run() error {
 		}
 		go func() {
 			defer conn.Close()
-			err := handleConnection(conn)
+			err := handleConnection(conn, s.Config)
 			if err != nil {
 				log.Printf("handle failure from %s: %s", conn.RemoteAddr(), err)
 			}
@@ -51,8 +70,8 @@ func (s *SOCKS5Server) Run() error {
 	}
 }
 
-func handleConnection(conn net.Conn) error {
-	if err := auth(conn); err != nil {
+func handleConnection(conn net.Conn, config *Config) error {
+	if err := auth(conn, config); err != nil {
 		return err
 	}
 	targetConn, err := request(conn)
@@ -95,15 +114,17 @@ func request(conn io.ReadWriter) (io.ReadWriteCloser, error) {
 	return targetConn, WriteRequestSuccessMessage(conn, addr.IP, uint16(addr.Port))
 }
 
-func auth(conn net.Conn) error {
+func auth(conn io.ReadWriter, config *Config) error {
+	// Read client auth message
 	clientMessage, err := NewClientAuthMessage(conn)
 	if err != nil {
 		return err
 	}
 
+	// Check if the auth method is supported
 	var acceptable bool
 	for _, method := range clientMessage.Methods {
-		if method == MethodNoAuth {
+		if method == config.AuthMethod {
 			acceptable = true
 		}
 	}
@@ -113,5 +134,23 @@ func auth(conn net.Conn) error {
 		return errors.New("method not supported")
 	}
 
-	return NewServerAuthMessage(conn, MethodNoAuth)
+	if err := NewServerAuthMessage(conn, config.AuthMethod); err != nil {
+		return err
+	}
+
+	if config.AuthMethod == MethodPassword {
+		clientPasswordMessage, err := NewClientPasswordMessage(conn)
+		if err != nil {
+			return err
+		}
+		if !config.PasswordChecker(clientPasswordMessage.Username, clientPasswordMessage.Password) {
+			WriteServerPasswordMessage(conn, PasswordAuthFailure)
+			return ErrPasswordAuthFailure
+		}
+
+		if err = WriteServerPasswordMessage(conn, PasswordAuthSuccess); err != nil {
+			return err
+		}
+	}
+	return nil
 }

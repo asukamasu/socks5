@@ -1,6 +1,7 @@
 package socks5
 
 import (
+	"errors"
 	"io"
 )
 
@@ -9,6 +10,31 @@ type ClientAuthMessage struct {
 	NMethod byte
 	Methods []Method
 }
+
+type ClientPasswordMessage struct {
+	Username string
+	Password string
+}
+
+type Method = byte
+
+const (
+	MethodNoAuth      Method = 0x00
+	MethodGSSAPI      Method = 0x01
+	MethodPassword    Method = 0x02
+	MethodNoAcceptble Method = 0xFF
+)
+
+const (
+	PasswordMethodVersion = 0x01
+	PasswordAuthSuccess   = 0x00
+	PasswordAuthFailure   = 0x01
+)
+
+var (
+	ErrPasswordCheckerNotSet = errors.New("error password check not set")
+	ErrPasswordAuthFailure   = errors.New("error authenticating username password")
+)
 
 func NewClientAuthMessage(conn io.Reader) (*ClientAuthMessage, error) {
 	// Read version, nMethods
@@ -42,11 +68,39 @@ func NewServerAuthMessage(conn io.Writer, method Method) error {
 	return err
 }
 
-type Method = byte
+func NewClientPasswordMessage(conn io.Reader) (*ClientPasswordMessage, error) {
+	// Read version and username length
+	buf := make([]byte, 2)
+	if _, err := io.ReadFull(conn, buf); err != nil {
+		return nil, err
+	}
 
-const (
-	MethodNoAuth      Method = 0x00
-	MethodGSSAPI      Method = 0x01
-	MethodPassword    Method = 0x02
-	MethodNoAcceptble Method = 0xFF
-)
+	version, usernameLen := buf[0], buf[1]
+	if version != PasswordMethodVersion {
+		return nil, ErrMethodVersionNotSupported
+	}
+
+	// Read username, password length
+	buf = make([]byte, usernameLen+1)
+	if _, err := io.ReadFull(conn, buf); err != nil {
+		return nil, err
+	}
+	username, passwordLen := string(buf[:len(buf)-1]), buf[len(buf)-1]
+
+	// Read password
+	if len(buf) < int(passwordLen) {
+		buf = make([]byte, passwordLen)
+	}
+	if _, err := io.ReadFull(conn, buf[:passwordLen]); err != nil {
+		return nil, err
+	}
+	return &ClientPasswordMessage{
+		Username: username,
+		Password: string(buf[:passwordLen]),
+	}, nil
+}
+
+func WriteServerPasswordMessage(conn io.Writer, status byte) error {
+	_, err := conn.Write([]byte{PasswordMethodVersion, status})
+	return err
+}
